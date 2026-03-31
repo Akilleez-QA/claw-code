@@ -1,4 +1,5 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,6 +36,8 @@ impl From<ConfigError> for PromptBuildError {
 
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
+const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
+const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -202,7 +205,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             push_context_file(&mut files, candidate)?;
         }
     }
-    Ok(files)
+    Ok(dedupe_instruction_files(files))
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
@@ -237,10 +240,17 @@ fn read_git_status(cwd: &Path) -> Option<String> {
 
 fn render_project_context(project_context: &ProjectContext) -> String {
     let mut lines = vec!["# Project context".to_string()];
-    lines.extend(prepend_bullets(vec![format!(
-        "Today's date is {}.",
-        project_context.current_date
-    )]));
+    let mut bullets = vec![
+        format!("Today's date is {}.", project_context.current_date),
+        format!("Working directory: {}", project_context.cwd.display()),
+    ];
+    if !project_context.instruction_files.is_empty() {
+        bullets.push(format!(
+            "Claude instruction files discovered: {}.",
+            project_context.instruction_files.len()
+        ));
+    }
+    lines.extend(prepend_bullets(bullets));
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
@@ -251,11 +261,103 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
     let mut sections = vec!["# Claude instructions".to_string()];
+    let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
-        sections.push(format!("## {}", file.path.display()));
-        sections.push(file.content.trim().to_string());
+        if remaining_chars == 0 {
+            sections.push(
+                "_Additional instruction content omitted after reaching the prompt budget._"
+                    .to_string(),
+            );
+            break;
+        }
+
+        let raw_content = truncate_instruction_content(&file.content, remaining_chars);
+        let rendered_content = render_instruction_content(&raw_content);
+        let consumed = rendered_content.chars().count().min(remaining_chars);
+        remaining_chars = remaining_chars.saturating_sub(consumed);
+
+        sections.push(format!("## {}", describe_instruction_file(file, files)));
+        sections.push(rendered_content);
     }
     sections.join("\n\n")
+}
+
+fn dedupe_instruction_files(files: Vec<ContextFile>) -> Vec<ContextFile> {
+    let mut deduped = Vec::new();
+    let mut seen_hashes = Vec::new();
+
+    for file in files {
+        let normalized = normalize_instruction_content(&file.content);
+        let hash = stable_content_hash(&normalized);
+        if seen_hashes.contains(&hash) {
+            continue;
+        }
+        seen_hashes.push(hash);
+        deduped.push(file);
+    }
+
+    deduped
+}
+
+fn normalize_instruction_content(content: &str) -> String {
+    collapse_blank_lines(content).trim().to_string()
+}
+
+fn stable_content_hash(content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> String {
+    let path = display_context_path(&file.path);
+    let scope = files
+        .iter()
+        .filter_map(|candidate| candidate.path.parent())
+        .find(|parent| file.path.starts_with(parent))
+        .map_or_else(
+            || "workspace".to_string(),
+            |parent| parent.display().to_string(),
+        );
+    format!("{path} (scope: {scope})")
+}
+
+fn truncate_instruction_content(content: &str, remaining_chars: usize) -> String {
+    let hard_limit = MAX_INSTRUCTION_FILE_CHARS.min(remaining_chars);
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= hard_limit {
+        return trimmed.to_string();
+    }
+
+    let mut output = trimmed.chars().take(hard_limit).collect::<String>();
+    output.push_str("\n\n[truncated]");
+    output
+}
+
+fn render_instruction_content(content: &str) -> String {
+    truncate_instruction_content(content, MAX_INSTRUCTION_FILE_CHARS)
+}
+
+fn display_context_path(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn collapse_blank_lines(content: &str) -> String {
+    let mut result = String::new();
+    let mut previous_blank = false;
+    for line in content.lines() {
+        let is_blank = line.trim().is_empty();
+        if is_blank && previous_blank {
+            continue;
+        }
+        result.push_str(line.trim_end());
+        result.push('\n');
+        previous_blank = is_blank;
+    }
+    result
 }
 
 pub fn load_system_prompt(
@@ -348,9 +450,14 @@ fn get_actions_section() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY};
+    use super::{
+        collapse_blank_lines, display_context_path, normalize_instruction_content,
+        render_instruction_content, render_instruction_files, truncate_instruction_content,
+        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    };
     use crate::config::ConfigLoader;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
@@ -392,6 +499,45 @@ mod tests {
             ]
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn dedupes_identical_instruction_content_across_scopes() {
+        let root = temp_dir();
+        let nested = root.join("apps").join("api");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
+
+        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        assert_eq!(context.instruction_files.len(), 1);
+        assert_eq!(
+            normalize_instruction_content(&context.instruction_files[0].content),
+            "same rules"
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn truncates_large_instruction_content_for_rendering() {
+        let rendered = render_instruction_content(&"x".repeat(4500));
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.len() < 4_100);
+    }
+
+    #[test]
+    fn normalizes_and_collapses_blank_lines() {
+        let normalized = normalize_instruction_content("line one\n\n\nline two\n");
+        assert_eq!(normalized, "line one\n\nline two");
+        assert_eq!(collapse_blank_lines("a\n\n\n\nb\n"), "a\n\nb\n");
+    }
+
+    #[test]
+    fn displays_context_paths_compactly() {
+        assert_eq!(
+            display_context_path(Path::new("/tmp/project/.claude/CLAUDE.md")),
+            "CLAUDE.md"
+        );
     }
 
     #[test]
@@ -475,5 +621,24 @@ mod tests {
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn truncates_instruction_content_to_budget() {
+        let content = "x".repeat(5_000);
+        let rendered = truncate_instruction_content(&content, 4_000);
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.chars().count() <= 4_000 + "\n\n[truncated]".chars().count());
+    }
+
+    #[test]
+    fn renders_instruction_file_metadata() {
+        let rendered = render_instruction_files(&[ContextFile {
+            path: PathBuf::from("/tmp/project/CLAUDE.md"),
+            content: "Project rules".to_string(),
+        }]);
+        assert!(rendered.contains("# Claude instructions"));
+        assert!(rendered.contains("scope: /tmp/project"));
+        assert!(rendered.contains("Project rules"));
     }
 }
