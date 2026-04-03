@@ -5,6 +5,7 @@ mod compact;
 mod config;
 mod conversation;
 mod file_ops;
+pub mod green_contract;
 mod hooks;
 mod json;
 pub mod lsp_client;
