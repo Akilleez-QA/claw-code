@@ -1,0 +1,24 @@
+# ARM cross-compilation targets for edge deployment
+#
+# Prerequisites:
+#   rustup target add aarch64-unknown-linux-gnu
+#   apt install gcc-aarch64-linux-gnu  (on Debian/Ubuntu)
+#   OR: cargo install cross && cross build --target aarch64-unknown-linux-gnu
+#
+# Pi 4/5 (64-bit):  aarch64-unknown-linux-gnu
+# Pi Zero 2W:       aarch64-unknown-linux-gnu  (same ISA, less RAM)
+# Edge containers:  x86_64-unknown-linux-musl  (fully static)
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+[profile.edge]
+inherits = "release"
+opt-level = "z"          # optimize for binary size
+lto = true               # link-time optimization
+codegen-units = 1        # single codegen unit for maximum optimization
+strip = true             # strip debug symbols
+panic = "abort"          # smaller panic handler

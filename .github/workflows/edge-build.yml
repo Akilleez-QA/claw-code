@@ -1,0 +1,143 @@
+name: Edge Agent — ARM Cross-Compile
+
+# Produces a size-optimized aarch64 binary (claw-edge) ready to scp to
+# a Raspberry Pi 4/5. Artifact is available for 30 days after each run.
+#
+# Trigger options:
+#   - Push a tag like  v0.1.0-edge  to build + upload a named release binary
+#   - Manual dispatch (Actions → "Run workflow") for ad-hoc builds
+#   - Any push to main (build verification only — artifact still uploaded)
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*-edge'
+  pull_request:
+    paths:
+      - 'rust/crates/edge-agent/**'
+      - 'rust/crates/runtime/**'
+      - 'rust/crates/api/**'
+      - 'rust/Cargo.*'
+      - 'rust/.cargo/**'
+      - '.github/workflows/edge-build.yml'
+  workflow_dispatch:
+    inputs:
+      upload_artifact:
+        description: 'Upload binary as artifact'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Cache key prefix — bump to bust cache
+  CACHE_KEY: v1
+
+jobs:
+  build-edge-arm:
+    name: Cross-compile claw-edge (aarch64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Rust stable + aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+          key: ${{ env.CACHE_KEY }}-aarch64-edge-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ env.CACHE_KEY }}-aarch64-edge-
+
+      - name: Build edge-agent (edge profile, aarch64)
+        working-directory: rust
+        run: |
+          cargo build \
+            --profile edge \
+            --target aarch64-unknown-linux-gnu \
+            --package edge-agent \
+            -v
+
+      - name: Report binary size
+        working-directory: rust
+        run: |
+          BINARY=target/aarch64-unknown-linux-gnu/edge/claw-edge
+          echo "## Binary Info" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Path | \`$BINARY\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Size | $(du -sh $BINARY | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Arch | $(file $BINARY | cut -d: -f2 | xargs) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo '# Download artifact, then:' >> $GITHUB_STEP_SUMMARY
+          echo 'scp claw-edge pi@auburndale-pi4.local:/usr/local/bin/' >> $GITHUB_STEP_SUMMARY
+          echo 'ssh pi@auburndale-pi4.local chmod +x /usr/local/bin/claw-edge' >> $GITHUB_STEP_SUMMARY
+          echo 'ssh pi@auburndale-pi4.local claw-edge' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh $BINARY
+
+      - name: Upload binary artifact
+        if: ${{ github.event_name != 'pull_request' || inputs.upload_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-edge-aarch64-${{ github.sha }}
+          path: rust/target/aarch64-unknown-linux-gnu/edge/claw-edge
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rust/target/aarch64-unknown-linux-gnu/edge/claw-edge
+          name: ${{ github.ref_name }}
+          body: |
+            ## ThermoLogic Edge Agent — ${{ github.ref_name }}
+
+            ARM64 binary built with `--profile edge` (size-optimized, LTO, stripped).
+
+            ### Deploy to Auburndale Pi 4
+            ```bash
+            # Download claw-edge from release assets, then:
+            scp claw-edge pi@auburndale-pi4.local:/usr/local/bin/
+            ssh pi@auburndale-pi4.local chmod +x /usr/local/bin/claw-edge
+
+            # Verify offline mode
+            ssh pi@auburndale-pi4.local claw-edge
+            # Expected: "ThermoLogic Edge (offline mode) — PT Calculator"
+
+            # Quick PT test
+            echo "R-410A 45" | ssh pi@auburndale-pi4.local claw-edge
+            # Expected: "R-410A: 45.0°F → ~180 PSIG (194.7 PSIA)"
+            ```
+
+            ### Online Mode (with API Key)
+            ```bash
+            ssh pi@auburndale-pi4.local
+            export ANTHROPIC_API_KEY=sk-...
+            export EDGE_MODEL=claude-haiku-4-5-20251001
+            claw-edge
+            ```
+
+            See [REF-396 deployment plan](https://github.com) for systemd config and benchmark protocol.

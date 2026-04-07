@@ -1,0 +1,31 @@
+[package]
+name = "edge-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ThermoLogic edge agent — minimal ARM-optimized binary for facility hardware"
+
+[[bin]]
+name = "claw-edge"
+path = "src/main.rs"
+
+[features]
+default = ["pt-calculator", "rag-sqlite"]
+pt-calculator = []
+rag-sqlite = ["dep:rusqlite"]
+
+[dependencies]
+runtime = { path = "../runtime" }
+api = { path = "../api" }
+# tools crate omitted — edge binary uses its own minimal tool set to avoid
+# pulling in reqwest blocking + the full MVP tool suite (~4 MB extra)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+# SQLite for local RAG — bundled = no system libsqlite3 needed on Pi
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+[lints]
+workspace = true
