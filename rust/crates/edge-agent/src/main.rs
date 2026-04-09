@@ -115,6 +115,7 @@ impl ApiClient for EdgeApiClient {
             tools: has_tools.then(|| self.tool_defs.clone()),
             tool_choice: has_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.rt.block_on(async {
@@ -329,7 +330,7 @@ fn build_tool_executor(_rag_db_path: Option<String>) -> StaticToolExecutor {
 
 fn edge_permission_policy() -> PermissionPolicy {
     // Edge tools are all read-only calculations — no file mutation, no bash.
-    PermissionPolicy::new(PermissionMode::Default)
+    PermissionPolicy::new(PermissionMode::ReadOnly)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -353,7 +354,7 @@ fn main() {
 
     let tool_executor = build_tool_executor(rag_db);
 
-    let session = Session { version: 1, messages: Vec::new() };
+    let session = Session::new();
 
     if use_api {
         let api_client = api_client_result.unwrap();
